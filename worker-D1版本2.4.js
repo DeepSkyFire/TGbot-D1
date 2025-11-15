@@ -121,7 +121,26 @@ async function dbConfigGet(key, env) {
     ).bind(userId, messageId).first();
     return row || null;
   }
-  
+
+  /**
+  * [D1 Abstraction] 删除指定用户的所有消息记录 (messages table)
+  */
+  async function dbMessagesDeleteByUser(userId, env) {
+      await env.TG_BOT_DB
+          .prepare("DELETE FROM messages WHERE user_id = ?")
+          .bind(userId)
+          .run();
+  }
+
+/**
+ * [D1 Abstraction] 删除指定用户记录 (users table)
+ */
+  async function dbUserDelete(userId, env) {
+      await env.TG_BOT_DB
+          .prepare("DELETE FROM users WHERE user_id = ?")
+          .bind(userId)
+          .run();
+  }
   
   /**
   * [D1 Abstraction] 清除管理员编辑状态
@@ -1663,9 +1682,51 @@ async function dbConfigGet(key, env) {
         }, env);
   
     } catch (e) {
-        const errorMessage = `❌ 转发失败！请联系管理员。错误详情：${e.message}`;
-        console.error(errorMessage);
-        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorMessage });
+        const errText = String(e && e.message ? e.message : e || "");
+        console.error("handleRelayToTopic error:", errText);
+        if (errText.includes("message thread not found")) {
+            const userId = chatId; // 私聊里的 user_id 就是 chatId
+            const isBlocked = !!user.is_blocked;
+            const blockCount = Number(user.block_count || 0);
+            
+            try{
+                // 情况 1：已经是 blocked 的人 -> 永封，清掉 topic & 消息记录，但保留用户记录
+                if (isBlocked) {
+                    await dbMessagesDeleteByUser(userId, env);
+                    await dbUserUpdate(userId, { topic_id: null }, env);
+                    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                        chat_id: userId,
+                        text: "❌ 您当前处于封禁状态，因此不会再转发消息。",
+                    });
+                    return;
+                }
+                // 情况 2：未被 blocked，但 block_count > 0 -> 当作人工永封
+                if (!isBlocked && blockCount > 0) {
+                    await dbMessagesDeleteByUser(userId, env);
+                    await dbUserUpdate(userId, { is_blocked: true }, env);
+                    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                        chat_id: userId,
+                        text: "❌ 您当前处于封禁状态，因此不会再转发消息。",
+                    });
+                    return;
+                }
+                // 情况 3：既没被 blocked，block_count 也为 0 -> 异世界转生重新做人
+                await dbMessagesDeleteByUser(userId, env);
+                await dbUserDelete(userId, env);
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: userId,
+                    text: "⚠️ 管理员已将您的状态彻底重置，请使用 /start 命令重新开始。",
+                });
+                return;
+            } catch (dbErr) {
+                console.error("Failed to cleanup after deleted topic:", dbErr?.message || dbErr);
+                // 如果这里也挂了，那就让他自己想办法联系管理员吧
+            }
+        } else {
+            const errorMessage = `❌ 转发失败！请联系管理员。错误详情：${e.message}`;
+            console.error(errorMessage);
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorMessage });
+        }  
     }
   }
   
