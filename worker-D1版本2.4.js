@@ -16,6 +16,8 @@
  * [修复] 解决管理员在话题中编辑回复，用户收不到的问题。
  * [修复] 解决用户回答正确的验证答案时，该消息也被转发的问题。
  * [新增] 增强管理员编辑消息通知，包含旧内容、旧时间、新内容和新编辑时间，以镜像用户编辑通知。
+ * * **【重要修复】**
+ * **[修复] 话题删除后自动重建：在 handleRelayToTopic 捕获 message thread not found 错误，自动清除 D1 记录并创建新话题。**
  */
 
 
@@ -893,7 +895,7 @@ async function dbConfigGet(key, env) {
   <b>当前设置:</b>
   • 欢迎消息: ${escapeHtml(welcomeMsg).substring(0, 30)}...
   • 验证问题: ${escapeHtml(verifQ).substring(0, 30)}...
-  • 验证答案: <code>${escapeHtml(verifA)}</code>
+  • 验证答案(答案可以是多个，用符合|进行隔断): <code>${escapeHtml(verifA)}</code>
   
   请选择要修改的配置项:
     `.trim();
@@ -1663,9 +1665,95 @@ async function dbConfigGet(key, env) {
         }, env);
   
     } catch (e) {
-        const errorMessage = `❌ 转发失败！请联系管理员。错误详情：${e.message}`;
-        console.error(errorMessage);
-        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorMessage });
+        // **【核心 BUG 修复区域】**
+        const errorMessage = e.message || e.description || JSON.stringify(e);
+  
+        // 检查是否是“话题不存在”的错误
+        if (errorMessage.includes("message thread not found")) {
+            console.warn(`[Auto-Fix] 话题 ID ${topicId} 已失效。为用户 ${chatId} 尝试重建话题。`);
+            
+            try {
+                // 1. 清除数据库中错误的 topic_id 和 user_info_json，强制下次重新创建
+                // **【关键修复点】**
+                await dbUserUpdate(chatId, { topic_id: null, user_info_json: null }, env); 
+  
+                // 2. 重新执行创建话题的逻辑 (从 if (!topicId) 块复制)
+                const { topicName, infoCard } = getUserInfo(fromUser, message.date);
+                
+                // 2.1. 创建话题
+                const topicResult = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    name: topicName,
+                });
+                const newTopicId = topicResult.message_thread_id.toString();
+                
+                // 2.2. 更新 D1 记录
+                await dbUserUpdate(chatId, { topic_id: newTopicId, user_info: { infoCard, messageId: null, timestamp: message.date } }, env);
+                
+                // 2.3. 发送资料卡到话题，并置顶
+                const cardMessage = await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    text: infoCard,
+                    parse_mode: "HTML",
+                    message_thread_id: newTopicId,
+                    reply_markup: getInfoCardButtons(chatId, false)
+                });
+                
+                // 2.4. 更新 D1 存储资料卡消息ID
+                await dbUserUpdate(chatId, { user_info: { infoCard, messageId: cardMessage.message_id, timestamp: message.date } }, env);
+    
+                // 2.5. 置顶资料卡
+                await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_id: cardMessage.message_id,
+                    disable_notification: true
+                });
+                
+                // 3. 再次尝试转发用户消息到新的话题
+                const copyParamsRetry = {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    from_chat_id: chatId,
+                    message_id: message.message_id,
+                    message_thread_id: newTopicId,
+                };
+  
+                // 备份群组（可选）- 重新执行备份逻辑
+                const backupGroupId = await getConfig('backup_group_id', env, "");
+                if (backupGroupId) {
+                    try {
+                        const backupParams = { ...copyParamsRetry, chat_id: backupGroupId };
+                        delete backupParams.message_thread_id; 
+                        await telegramApi(env.BOT_TOKEN, "copyMessage", backupParams);
+                    } catch(e) {
+                        console.error("Failed to copy message to backup group on retry:", e.message);
+                    }
+                }
+  
+                await telegramApi(env.BOT_TOKEN, "copyMessage", copyParamsRetry);
+                
+                // 4. 存储消息映射关系
+                await dbMessageDataPut(chatId, message.message_id.toString(), { 
+                    text: message.text || message.caption || "[媒体内容]", 
+                    date: message.date 
+                }, env);
+  
+                // 修复成功，退出函数
+                return;
+  
+            } catch (retryError) {
+                // 如果二次尝试仍然失败
+                const retryErrorMessage = `❌ 转发失败！自动重建话题失败，请联系管理员。错误详情：${retryError.message}`;
+                console.error(retryErrorMessage);
+                await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: retryErrorMessage });
+                return;
+            }
+        }
+        // **【END BUG 修复区域】**
+  
+        // 如果是其他错误，执行原始错误处理逻辑
+        const errorMessageDefault = `❌ 转发失败！请联系管理员。错误详情：${e.message}`;
+        console.error(errorMessageDefault);
+        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorMessageDefault });
     }
   }
   
